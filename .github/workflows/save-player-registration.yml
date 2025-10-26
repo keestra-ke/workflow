@@ -1,0 +1,103 @@
+name: Save Player Registration
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'Player name'
+        required: false
+      email:
+        description: 'Player email'
+        required: false
+      metadata:
+        description: 'Extra JSON metadata (optional). Example: {"team":"red","age":22}'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  save-player:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Ensure players.json exists and append entry
+        id: append
+        run: |
+          set -euo pipefail
+
+          FILE="players.json"
+          mkdir -p "$(dirname "$FILE")" || true
+          if [ ! -f "$FILE" ]; then
+            echo "[]" > "$FILE"
+          fi
+
+          # Determine source of registration data:
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            NAME="${{ github.event.inputs.name }}"
+            EMAIL="${{ github.event.inputs.email }}"
+            METADATA="${{ github.event.inputs.metadata }}"
+          else
+            # On push, use actor and commit info as a default registration
+            NAME="${{ github.actor }}"
+            EMAIL=""
+            METADATA=""
+          fi
+
+          # Fallbacks
+          NAME="${NAME:-anonymous}"
+          EMAIL="${EMAIL:-}"
+
+          # Generate an id and timestamp
+          ID="$(date +%s)-$(head -c6 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          # Prepare extra JSON if provided and valid, otherwise empty object
+          EXTRA="{}"
+          if [ -n "$METADATA" ]; then
+            if echo "$METADATA" | jq -e . >/dev/null 2>&1; then
+              EXTRA="$METADATA"
+            else
+              echo "Warning: metadata input is not valid JSON, ignoring it" >&2
+              EXTRA="{}"
+            fi
+          fi
+
+          # Create new entry and append atomically
+          ENTRY=$(jq -n --arg id "$ID" --arg name "$NAME" --arg email "$EMAIL" --arg ts "$TS" --argjson extra "$EXTRA" \
+            '{id: $id, name: $name, email: $email, registered_at: $ts} + $extra')
+
+          tmp=$(mktemp)
+          jq --argjson entry "$ENTRY" '. + [$entry]' "$FILE" > "$tmp" && mv "$tmp" "$FILE"
+
+          echo "Appended player entry: $ENTRY"
+          echo "players_file=$FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push players.json (skip if run by GitHub Actions bot)
+        if: github.actor != 'github-actions[bot]'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add players.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore: add player registration by ${{ github.actor }}"
+          # Push back to the branch that triggered the workflow
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - name: Summary
+        run: |
+          echo "Registration workflow completed."
+          echo "If you used workflow_dispatch you can supply name, email and metadata inputs."
